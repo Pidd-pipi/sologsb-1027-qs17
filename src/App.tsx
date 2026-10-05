@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useReducer, useRef, useState } from 'react';
 import {
+  Alert,
   Button,
   Callout,
   Card,
@@ -16,76 +17,28 @@ import {
   Tag,
   TextArea
 } from '@blueprintjs/core';
+import type {
+  DiffItem,
+  ExperimentProcess,
+  HistoryState,
+  ProcessStep,
+  ProcessStatus,
+  StepStatus,
+  VersionSnapshot,
+  ViewId
+} from './types';
+import { formatBytes, getCapacity, loadFromStorage, saveToStorage } from './storage';
+import type { CapacityStatus } from './storage';
+import {
+  buildArchivePlan,
+  getProtectedReasons,
+  materializeVersion,
+  migrateProcess,
+  PROTECTED_REASON_LABEL,
+  runArchiveCompression
+} from './archive';
+import type { ArchiveCandidate, ProtectedReason } from './archive';
 
-type StepStatus = 'draft' | 'submitted' | 'confirmed' | 'returned';
-type ProcessStatus = 'draft' | 'in-review' | 'frozen' | 'revising';
-type ViewId = 'editor' | 'review' | 'compare';
-
-interface ReviewComment {
-  id: string;
-  author: string;
-  role: string;
-  text: string;
-  createdAt: string;
-  resolved: boolean;
-}
-
-interface ProcessStep {
-  id: string;
-  title: string;
-  purpose: string;
-  materials: string;
-  equipment: string;
-  amount: string;
-  duration: number;
-  hazards: string[];
-  controls: string;
-  dependencies: string[];
-  safetyNote: string;
-  expectedResult: string;
-  status: StepStatus;
-  comments: ReviewComment[];
-}
-
-interface VersionSnapshot {
-  id: string;
-  label: string;
-  version: string;
-  createdAt: string;
-  note: string;
-  author: string;
-  steps: ProcessStep[];
-}
-
-interface ExperimentProcess {
-  id: string;
-  title: string;
-  code: string;
-  objective: string;
-  principal: string;
-  lab: string;
-  status: ProcessStatus;
-  version: string;
-  steps: ProcessStep[];
-  versions: VersionSnapshot[];
-  frozenAt?: string;
-  updatedAt: string;
-}
-
-interface HistoryState {
-  past: ExperimentProcess[];
-  present: ExperimentProcess;
-  future: ExperimentProcess[];
-}
-
-interface DiffItem {
-  id: string;
-  title: string;
-  kind: 'added' | 'removed' | 'changed';
-  detail: string;
-}
-
-const STORAGE_KEY = 'sologsb-1027-lab-safety-v1';
 const CURRENT_AUTHOR = '周宁';
 const CURRENT_ROLE = '安全复核员';
 const clone = <T,>(value: T): T => JSON.parse(JSON.stringify(value)) as T;
@@ -146,13 +99,50 @@ function initialProcess(): ExperimentProcess {
 
   const firstVersion: VersionSnapshot = {
     id: 'version-1-0', label: '首版批准流程', version: '1.0.0', createdAt: '2026-09-20T14:30:00+08:00',
-    note: '建立基础反应与取样步骤。', author: '王颖',
-    steps: clone(baseSteps).slice(0, 4).map((step) => ({ ...step, status: 'confirmed', comments: [] }))
+    note: '建立基础反应与取样步骤。', author: '王颖', storage: 'full',
+    steps: clone(baseSteps).slice(0, 4).map((step) => ({ ...step, status: 'confirmed' as StepStatus, comments: [] })),
+    approval: { approved: true, approver: '王颖', approvedAt: '2026-09-20T14:30:00+08:00' }
   };
   const secondVersion: VersionSnapshot = {
-    id: 'version-1-1', label: '补充冷却与废液步骤', version: '1.1.0', createdAt: '2026-09-24T15:10:00+08:00',
-    note: '增加安全冷却、废液处置和现场恢复。', author: '王颖',
-    steps: clone(baseSteps).map((step) => ({ ...step, status: 'confirmed', comments: [] }))
+    id: 'version-1-1', label: '复核通过冻结版', version: '1.1.0', createdAt: '2026-09-24T15:10:00+08:00',
+    note: '增加安全冷却、废液处置和现场恢复。', author: '王颖', storage: 'full',
+    steps: clone(baseSteps).map((step) => ({ ...step, status: 'confirmed' as StepStatus, comments: [] })),
+    approval: { approved: true, approver: '王颖', approvedAt: '2026-09-24T15:10:00+08:00' },
+    signature: { signed: true, signer: '王颖', signedAt: '2026-09-24T15:12:00+08:00' }
+  };
+
+  const workStepsA = clone(baseSteps).map((step, index) => ({
+    ...step,
+    status: (index < 2 ? 'confirmed' : 'submitted') as StepStatus
+  }));
+  const workSnapshotA: VersionSnapshot = {
+    id: 'version-work-1', label: '工作版本快照', version: '1.2.0-draft', createdAt: '2026-09-28T09:40:00+08:00',
+    note: '修订冷却速率表述，保存当前步骤与复核状态。', author: '李明', storage: 'full',
+    steps: workStepsA
+  };
+
+  const workStepsB = clone(workStepsA);
+  (workStepsB[3] as ProcessStep).controls = '取样前泄压；使用长针和防护屏并佩戴面屏；样品瓶及时封闭。';
+  (workStepsB[4] as ProcessStep).status = 'submitted';
+  const workSnapshotB: VersionSnapshot = {
+    id: 'version-work-2', label: '工作版本快照', version: '1.2.0-draft', createdAt: '2026-09-30T16:05:00+08:00',
+    note: '取样操作补充面屏要求，冷却步骤提交复核。', author: '李明', storage: 'full',
+    steps: workStepsB
+  };
+
+  const incidentVersion: VersionSnapshot = {
+    id: 'version-incident-1', label: '事故关联整改快照', version: '1.1.5-incident', createdAt: '2026-10-01T10:20:00+08:00',
+    note: '按 INC-2026-014 整改要求固定取样防护，关联留档不得回收。', author: '王颖', storage: 'full',
+    steps: clone(workStepsB),
+    incident: { linked: true, incidentCode: 'INC-2026-014', note: '取样针划伤事件整改版本', linkedAt: '2026-10-01T10:20:00+08:00' }
+  };
+
+  const workStepsC = clone(workStepsB);
+  (workStepsC[5] as ProcessStep).safetyNote = '废液不得倒入下水道，现场恢复后完成双人确认并上传交接照片。';
+  const workSnapshotC: VersionSnapshot = {
+    id: 'version-work-3', label: '工作版本快照', version: '1.2.0-draft', createdAt: '2026-10-03T11:00:00+08:00',
+    note: '废液交接增加照片留痕要求。', author: '周宁', storage: 'full',
+    steps: workStepsC
   };
 
   return {
@@ -160,7 +150,10 @@ function initialProcess(): ExperimentProcess {
     objective: '在受控温度下评价催化剂活性，并完整记录过程样品与安全控制措施。',
     principal: '李明', lab: '材料化学实验室 B-207',
     status: 'in-review', version: '1.2.0-draft',
-    steps: baseSteps, versions: [firstVersion, secondVersion], updatedAt: new Date().toISOString()
+    steps: baseSteps,
+    versions: [firstVersion, secondVersion, workSnapshotA, workSnapshotB, incidentVersion, workSnapshotC],
+    updatedAt: new Date().toISOString(),
+    archive: { schemaVersion: 2 }
   };
 }
 
@@ -169,6 +162,7 @@ function historyReducer(state: HistoryState, action:
   | { type: 'undo' }
   | { type: 'redo' }
   | { type: 'reset'; value: ExperimentProcess }
+  | { type: 'archive'; value: ExperimentProcess }
 ): HistoryState {
   if (action.type === 'commit') {
     const next = clone(state.present);
@@ -186,15 +180,21 @@ function historyReducer(state: HistoryState, action:
     if (!next) return state;
     return { past: [...state.past, clone(state.present)].slice(-60), present: next, future: state.future.slice(1) };
   }
+  if (action.type === 'archive') {
+    // 归档本身已落盘，保留撤销入口，但不改写 updatedAt
+    return { past: [...state.past.slice(-59), clone(state.present)], present: action.value, future: [] };
+  }
   return { past: [], present: action.value, future: [] };
 }
 
 function loadProcess(): ExperimentProcess {
+  const raw = loadFromStorage();
+  if (!raw) return initialProcess();
   try {
-    const value = localStorage.getItem(STORAGE_KEY);
-    if (!value) return initialProcess();
-    const parsed = JSON.parse(value) as ExperimentProcess;
-    return parsed.id && Array.isArray(parsed.steps) ? parsed : initialProcess();
+    // 旧数据缺少归档信息时先兼容迁移，迁移结果立即回写
+    const { process, changed } = migrateProcess(JSON.parse(raw));
+    if (changed) saveToStorage(JSON.stringify(process));
+    return process;
   } catch {
     return initialProcess();
   }
@@ -219,6 +219,11 @@ function formatDate(value: string): string {
   }).format(date);
 }
 
+interface QuotaIssue {
+  reclaimableBytes: number;
+  candidates: ArchiveCandidate[];
+}
+
 function App() {
   const [history, dispatch] = useReducer(historyReducer, undefined, () => ({ past: [], present: loadProcess(), future: [] }));
   const process = history.present;
@@ -230,6 +235,10 @@ function App() {
   const [online, setOnline] = useState(true);
   const [compareBaseId, setCompareBaseId] = useState(process.versions[0]?.id ?? '');
   const [compareTargetId, setCompareTargetId] = useState(process.versions.at(-1)?.id ?? '');
+  const [capacity, setCapacity] = useState<CapacityStatus | null>(null);
+  const [quotaIssue, setQuotaIssue] = useState<QuotaIssue | null>(null);
+  const [archiveConfirmOpen, setArchiveConfirmOpen] = useState(false);
+  const [archiveError, setArchiveError] = useState<string | null>(null);
   const initialSaveSkipped = useRef(false);
 
   const selectedStep = process.steps.find((step) => step.id === selectedStepId) ?? process.steps[0];
@@ -239,15 +248,42 @@ function App() {
   const pendingReviewCount = process.steps.filter((step) => step.status === 'submitted' || step.status === 'returned').length;
   const confirmedCount = process.steps.filter((step) => step.status === 'confirmed').length;
   const reviewProgress = process.steps.length ? Math.round((confirmedCount / process.steps.length) * 100) : 0;
-  const versionDiff = useMemo(() => compareVersions(process, compareBaseId, compareTargetId), [process, compareBaseId, compareTargetId]);
+
+  // 所有读取版本内容的入口共用同一份物化结果：版本比较、修订分支、时间线一致
+  const materializedVersions = useMemo(
+    () => process.versions.map((version) => materializeVersion(version, process.versions)),
+    [process.versions]
+  );
+  const versionDiff = useMemo(
+    () => compareVersions(materializedVersions, compareBaseId, compareTargetId),
+    [materializedVersions, compareBaseId, compareTargetId]
+  );
+  const archivePlan = useMemo(() => buildArchivePlan(process), [process]);
+
+  const persist = (value: ExperimentProcess, mode: 'auto' | 'manual'): boolean => {
+    const outcome = saveToStorage(JSON.stringify(value));
+    if (outcome.ok) {
+      setSavedLabel(`${mode === 'auto' ? '自动保存' : '手动保存'} · ${formatDate(new Date().toISOString())}`);
+      return true;
+    }
+    if (outcome.reason === 'quota') {
+      // 容量不足：拒绝本次写入，列出可回收候选，等待用户确认
+      const plan = buildArchivePlan(value);
+      setQuotaIssue({ reclaimableBytes: plan.totalReclaimableBytes, candidates: plan.candidates });
+      setSavedLabel('本地容量不足，写入已拒绝');
+    } else {
+      setSavedLabel('本地存储不可用，写入失败');
+    }
+    return false;
+  };
 
   useEffect(() => {
     if (!initialSaveSkipped.current) {
       initialSaveSkipped.current = true;
       return;
     }
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(process));
-    setSavedLabel(`自动保存 · ${formatDate(new Date().toISOString())}`);
+    persist(process, 'auto');
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [process]);
 
   useEffect(() => {
@@ -261,6 +297,14 @@ function App() {
     };
   }, []);
 
+  const refreshCapacity = (): void => {
+    getCapacity().then(setCapacity).catch(() => undefined);
+  };
+
+  useEffect(() => {
+    if (activeView === 'archive') refreshCapacity();
+  }, [activeView, process.versions]);
+
   useEffect(() => {
     const handleKeydown = (event: KeyboardEvent) => {
       const modifier = event.ctrlKey || event.metaKey;
@@ -273,12 +317,12 @@ function App() {
         dispatch({ type: 'redo' });
       } else if (event.key.toLowerCase() === 's') {
         event.preventDefault();
-        localStorage.setItem(STORAGE_KEY, JSON.stringify(process));
-        setSavedLabel(`手动保存 · ${formatDate(new Date().toISOString())}`);
+        persist(process, 'manual');
       }
     };
     window.addEventListener('keydown', handleKeydown);
     return () => window.removeEventListener('keydown', handleKeydown);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [process]);
 
   const commitProcess = (update: (draft: ExperimentProcess) => void): void => {
@@ -414,15 +458,21 @@ function App() {
     const nextNumber = nextMinorVersion(process.version);
     const previousVersionId = process.versions.at(-1)?.id ?? '';
     const frozenVersionId = uid('version');
+    const revisionSourceId = process.revisionBasisVersionId;
     commitProcess((draft) => {
       draft.versions.push({
         id: frozenVersionId, label: '复核通过冻结版', version: nextNumber,
         createdAt: new Date().toISOString(), note: `${draft.steps.length} 个步骤全部确认，安全控制完整。`,
-        author: CURRENT_AUTHOR, steps: clone(draft.steps)
+        author: CURRENT_AUTHOR, steps: clone(draft.steps), storage: 'full',
+        // 修订来源随批准版本保留
+        revisionSourceId: revisionSourceId,
+        approval: { approved: true, approver: CURRENT_AUTHOR, approvedAt: new Date().toISOString() },
+        signature: { signed: true, signer: CURRENT_AUTHOR, signedAt: new Date().toISOString() }
       });
       draft.version = nextNumber;
       draft.status = 'frozen';
       draft.frozenAt = new Date().toISOString();
+      draft.revisionBasisVersionId = undefined;
     });
     setSavedLabel(`版本 ${nextNumber} 已冻结`);
     setCompareBaseId(previousVersionId);
@@ -432,10 +482,13 @@ function App() {
   const startRevision = (): void => {
     if (process.status !== 'frozen') return;
     commitProcess((draft) => {
+      const basisId = draft.versions.at(-1)?.id;
       const nextNumber = nextMinorVersion(draft.version);
       draft.version = `${nextNumber}-revision`;
       draft.status = 'revising';
       draft.frozenAt = undefined;
+      // 标记修订来源，来源冻结版本在修订期间受保留保护
+      draft.revisionBasisVersionId = basisId;
       draft.steps.forEach((step) => {
         step.status = 'draft';
         step.comments = [];
@@ -450,10 +503,29 @@ function App() {
       draft.versions.push({
         id: uid('version'), label: '工作版本快照', version: draft.version.replace('-draft', ''),
         createdAt: new Date().toISOString(), note: '保存当前步骤与复核状态。',
-        author: CURRENT_AUTHOR, steps: clone(draft.steps)
+        author: CURRENT_AUTHOR, steps: clone(draft.steps), storage: 'full',
+        revisionSourceId: draft.status === 'revising' ? draft.revisionBasisVersionId : undefined
       });
     });
     setSavedLabel('已保存工作版本快照');
+  };
+
+  // 归档：先备份 -> 内存重建校验 -> 落盘；失败恢复归档前数据
+  const performArchive = (): void => {
+    setArchiveError(null);
+    try {
+      const result = runArchiveCompression(process);
+      dispatch({ type: 'archive', value: result.nextProcess });
+      setArchiveConfirmOpen(false);
+      setQuotaIssue(null);
+      setSavedLabel(`归档完成：${result.archivedCount} 个连续快照收成增量，约释放 ${formatBytes(result.reclaimedBytes)}`);
+      refreshCapacity();
+    } catch (error) {
+      setArchiveConfirmOpen(false);
+      setQuotaIssue(null);
+      setArchiveError(error instanceof Error ? error.message : '归档失败，已恢复归档前数据');
+      setSavedLabel('归档失败，已恢复归档前数据');
+    }
   };
 
   return (
@@ -461,7 +533,7 @@ function App() {
       <header className="app-header">
         <div className="brand-block">
           <div className="brand-icon"><Icon icon="lab-test" size={23} /></div>
-          <div><h1>实验流程安全复核台</h1><p>步骤影响分析 · 逐条复核 · 冻结版本</p></div>
+          <div><h1>实验流程安全复核台</h1><p>步骤影响分析 · 逐条复核 · 冻结版本 · 增量归档</p></div>
         </div>
         <div className="header-status">
           <span className={`network ${online ? 'online' : ''}`}></span>
@@ -472,11 +544,18 @@ function App() {
           <Button icon="undo" text="撤销" minimal disabled={history.past.length === 0} onClick={() => dispatch({ type: 'undo' })} />
           <Button icon="redo" text="重做" minimal disabled={history.future.length === 0} onClick={() => dispatch({ type: 'redo' })} />
           <Button icon="floppy-disk" text="保存快照" onClick={addVersionSnapshot} />
+          <Button icon="compressed" text="版本归档" onClick={() => setActiveView('archive')} />
           <Button icon="lock" text="冻结版本" intent="primary" onClick={freezeVersion} disabled={process.status === 'frozen'} />
         </div>
       </header>
 
       {!online && <Callout className="offline-callout" intent="warning" icon="cloud">网络不可用。编辑、复核和版本快照仍会保存在当前浏览器。</Callout>}
+      {archiveError && (
+        <div className="dismiss-callout">
+          <Callout intent="danger" icon="error">归档未执行：{archiveError}。归档前数据已恢复，版本比较、修订分支与撤销重做读取结果不变。</Callout>
+          <Button minimal small icon="cross" aria-label="关闭" onClick={() => setArchiveError(null)} />
+        </div>
+      )}
 
       <section className="process-banner">
         <div className="banner-main">
@@ -500,6 +579,7 @@ function App() {
         <Tab id="editor" title={<span><Icon icon="edit" /> 流程编写</span>} />
         <Tab id="review" title={<span><Icon icon="endorsed" /> 安全复核 {pendingReviewCount > 0 && <b className="tab-badge">{pendingReviewCount}</b>}</span>} />
         <Tab id="compare" title={<span><Icon icon="comparison" /> 版本比较</span>} />
+        <Tab id="archive" title={<span><Icon icon="compressed" /> 版本归档 {archivePlan.candidates.length > 0 && <b className="tab-badge">{archivePlan.candidates.length}</b>}</span>} />
       </Tabs>
 
       {activeView === 'editor' && selectedStep && (
@@ -676,20 +756,32 @@ function App() {
       {activeView === 'compare' && (
         <main className="compare-layout">
           <Card elevation={Elevation.ONE} className="version-panel">
-            <div className="card-title"><div><span>VERSION TIMELINE</span><h3>冻结版本</h3></div><Tag minimal>{process.versions.length} 个</Tag></div>
+            <div className="card-title"><div><span>VERSION TIMELINE</span><h3>版本时间线</h3></div><Tag minimal>{process.versions.length} 个</Tag></div>
             <div className="version-timeline">
-              {process.versions.map((version, index) => (
-                <article key={version.id} className={index === process.versions.length - 1 ? 'latest' : ''}>
-                  <span></span><div><b>{version.version}</b><strong>{version.label}</strong><p>{formatDate(version.createdAt)} · {version.steps.length} 个步骤 · {version.author}</p><small>{version.note}</small></div>
+              {materializedVersions.map((version, index) => (
+                <article key={version.id} className={index === materializedVersions.length - 1 ? 'latest' : ''}>
+                  <span></span>
+                  <div>
+                    <b>{version.version}</b>
+                    {process.versions[index]?.storage === 'delta' && <Tag minimal intent="none" className="storage-tag">增量归档</Tag>}
+                    <strong>{version.label}</strong>
+                    <p>{formatDate(version.createdAt)} · {version.steps.length} 个步骤 · {version.author}</p>
+                    <small>{version.note}</small>
+                    <div className="version-flags">
+                      {getProtectedReasons(version, process).map((reason) => (
+                        <Tag key={reason} minimal intent="warning" icon="shield">{PROTECTED_REASON_LABEL[reason]}</Tag>
+                      ))}
+                    </div>
+                  </div>
                 </article>
               ))}
             </div>
           </Card>
           <Card elevation={Elevation.ONE} className="diff-panel">
             <div className="card-title"><div><span>VERSION DIFF</span><h3>流程差异比较</h3></div><div className="diff-selects">
-              <HTMLSelect value={compareBaseId} onChange={(event) => setCompareBaseId(event.target.value)}>{process.versions.map((version) => <option key={version.id} value={version.id}>{version.version} · 基准</option>)}</HTMLSelect>
+              <HTMLSelect value={compareBaseId} onChange={(event) => setCompareBaseId(event.target.value)}>{materializedVersions.map((version) => <option key={version.id} value={version.id}>{version.version} · 基准</option>)}</HTMLSelect>
               <Icon icon="arrow-right" />
-              <HTMLSelect value={compareTargetId} onChange={(event) => setCompareTargetId(event.target.value)}>{process.versions.map((version) => <option key={version.id} value={version.id}>{version.version} · 目标</option>)}</HTMLSelect>
+              <HTMLSelect value={compareTargetId} onChange={(event) => setCompareTargetId(event.target.value)}>{materializedVersions.map((version) => <option key={version.id} value={version.id}>{version.version} · 目标</option>)}</HTMLSelect>
             </div></div>
             <div className="diff-table">
               <div className="diff-head"><span>变更类型</span><span>步骤</span><span>具体内容</span></div>
@@ -707,12 +799,129 @@ function App() {
         </main>
       )}
 
+      {activeView === 'archive' && (
+        <main className="archive-layout">
+          <Card elevation={Elevation.ONE} className="archive-capacity">
+            <div className="card-title">
+              <div><span>LOCAL CAPACITY</span><h3>浏览器本地容量</h3></div>
+              <Button minimal small icon="refresh" text="刷新" onClick={refreshCapacity} loading={!capacity} />
+            </div>
+            {capacity && (
+              <>
+                <ProgressBar value={Math.min(1, capacity.ratio)} intent={capacity.warning ? 'danger' : 'primary'} stripes={capacity.warning} />
+                <div className="capacity-grid">
+                  <div><span>已用</span><strong>{formatBytes(capacity.usedBytes)}</strong></div>
+                  <div><span>配额上限</span><strong>{formatBytes(capacity.quotaBytes)}</strong></div>
+                  <div><span>可用</span><strong className={capacity.warning ? 'danger-text' : ''}>{formatBytes(capacity.freeBytes)}</strong></div>
+                  <div><span>归档可释放</span><strong className="reclaim-text">{formatBytes(archivePlan.totalReclaimableBytes)}</strong></div>
+                </div>
+                {capacity.warning
+                  ? <Callout intent="danger" icon="warning-sign">容量已达 {Math.round(capacity.ratio * 100)}%，写入可能被拒绝。确认归档候选后可立即回收空间。</Callout>
+                  : <p className="muted">容量充足时也可以预先归档；容量不足时系统会拒绝写入并引导到此页面。</p>}
+              </>
+            )}
+            {process.archive?.lastArchivedAt && (
+              <p className="muted archive-last">上次归档：{formatDate(process.archive.lastArchivedAt)} · {process.archive.lastArchivedCount ?? 0} 个快照 · 释放约 {formatBytes(process.archive.lastReclaimedBytes ?? 0)}</p>
+            )}
+          </Card>
+
+          <Card elevation={Elevation.ONE} className="archive-candidates">
+            <div className="card-title">
+              <div><span>DELTA CANDIDATES</span><h3>可回收候选（连续快照收成字段增量）</h3></div>
+              <Tag minimal intent="primary">{archivePlan.candidates.length} 个候选</Tag>
+            </div>
+            <p className="muted">增量只保留相对最近完整锚点的步骤字段差异；版本头部、批准、签名、事故关联和修订来源随增量整体保留。</p>
+            <div className="candidate-list">
+              {archivePlan.candidates.map((candidate) => (
+                <div className="candidate-row" key={candidate.version.id}>
+                  <Icon icon="document" size={16} />
+                  <div className="candidate-copy">
+                    <strong>{candidate.version.version} · {candidate.version.label}</strong>
+                    <small>{formatDate(candidate.version.createdAt)} · 锚点 {anchorLabel(process.versions, candidate.basisId)}</small>
+                  </div>
+                  <div className="candidate-size"><span>{formatBytes(candidate.fullBytes)} → {formatBytes(candidate.deltaBytes)}</span><strong>−{formatBytes(candidate.reclaimableBytes)}</strong></div>
+                </div>
+              ))}
+              {!archivePlan.candidates.length && (
+                <div className="empty-diff"><Icon icon="tick-circle" intent="success" size={30} /><strong>暂无可归档的连续快照</strong><p>保留项版本与已归档增量不会重复处理。</p></div>
+              )}
+            </div>
+            <div className="archive-actions">
+              <Button intent="primary" icon="compressed" text="确认归档并回收空间" disabled={!archivePlan.candidates.length} onClick={() => setArchiveConfirmOpen(true)} />
+              <span className="muted">预计释放 {formatBytes(archivePlan.totalReclaimableBytes)}</span>
+            </div>
+          </Card>
+
+          <Card elevation={Elevation.ONE} className="archive-protected">
+            <div className="card-title"><div><span>RETAINED</span><h3>保留项（不参与回收）</h3></div><Icon icon="shield" size={18} /></div>
+            <div className="protected-list">
+              {archivePlan.protectedVersions.map(({ version, reasons }) => (
+                <div key={version.id} className="protected-row">
+                  <strong>{version.version}</strong>
+                  <div>{reasons.map((reason: ProtectedReason) => <Tag key={reason} minimal intent="warning">{PROTECTED_REASON_LABEL[reason]}</Tag>)}</div>
+                </div>
+              ))}
+              {!archivePlan.protectedVersions.length && <p className="muted">暂无带保留标记的版本。</p>}
+            </div>
+            <Divider />
+            <div className="card-title"><div><span>ARCHIVED</span><h3>已归档增量</h3></div><Tag minimal>{archivePlan.deltaVersions.length} 个</Tag></div>
+            <div className="protected-list">
+              {archivePlan.deltaVersions.map((version) => (
+                <div key={version.id} className="protected-row">
+                  <strong>{version.version}</strong>
+                  <small>{formatDate(version.archivedAt ?? version.createdAt)} 归档</small>
+                </div>
+              ))}
+              {!archivePlan.deltaVersions.length && <p className="muted">尚未执行归档。</p>}
+            </div>
+          </Card>
+        </main>
+      )}
+
+      <Alert
+        isOpen={archiveConfirmOpen}
+        icon="compressed"
+        intent="primary"
+        confirmButtonText={`确认归档（释放约 ${formatBytes(archivePlan.totalReclaimableBytes)}）`}
+        cancelButtonText="取消"
+        onConfirm={performArchive}
+        onCancel={() => setArchiveConfirmOpen(false)}
+      >
+        <p>将把 {archivePlan.candidates.length} 个连续完整快照压缩为字段级增量。</p>
+        <ul className="alert-list">
+          {archivePlan.candidates.slice(0, 6).map((candidate) => (
+            <li key={candidate.version.id}>{candidate.version.version} · {candidate.version.label}（−{formatBytes(candidate.reclaimableBytes)}）</li>
+          ))}
+        </ul>
+        <p>批准、签名、事故关联和修订来源版本保留完整数据；压缩会先在内存重建校验，失败自动恢复归档前数据。</p>
+      </Alert>
+
+      <Alert
+        isOpen={quotaIssue !== null}
+        icon="warning-sign"
+        intent="danger"
+        confirmButtonText={quotaIssue && quotaIssue.candidates.length ? '查看候选并归档' : '我知道了'}
+        cancelButtonText="暂不处理"
+        onConfirm={() => { if (quotaIssue?.candidates.length) { setActiveView('archive'); setArchiveConfirmOpen(true); } setQuotaIssue(null); }}
+        onCancel={() => setQuotaIssue(null)}
+      >
+        <p><strong>本地容量不足，本次写入已被拒绝。</strong>当前编辑仍保留在页面中，未丢失。</p>
+        {quotaIssue && quotaIssue.candidates.length > 0
+          ? <p>检测到 {quotaIssue.candidates.length} 个可回收候选，归档后约可释放 {formatBytes(quotaIssue.reclaimableBytes)}，确认后才会执行压缩并重新保存。</p>
+          : <p>暂无可回收的归档候选（版本均为保留项或已归档），请先在浏览器中清理其他站点数据。</p>}
+      </Alert>
+
       <footer className="app-footer">
         <span>所有实验数据仅保存在当前浏览器 localStorage。</span>
         <span>Ctrl/Cmd + Z 撤销 · Ctrl/Cmd + Y 重做 · Ctrl/Cmd + S 保存</span>
       </footer>
     </div>
   );
+}
+
+function anchorLabel(versions: VersionSnapshot[], basisId: string): string {
+  const basis = versions.find((version) => version.id === basisId);
+  return basis ? basis.version : basisId;
 }
 
 function hasMissingSafety(step: ProcessStep): boolean {
@@ -739,9 +948,9 @@ function nextMinorVersion(value: string): string {
   return `${match[1]}.${Number(match[2]) + 1}.0`;
 }
 
-function compareVersions(process: ExperimentProcess, baseId: string, targetId: string): DiffItem[] {
-  const base = process.versions.find((version) => version.id === baseId);
-  const target = process.versions.find((version) => version.id === targetId);
+function compareVersions(versions: VersionSnapshot[], baseId: string, targetId: string): DiffItem[] {
+  const base = versions.find((version) => version.id === baseId);
+  const target = versions.find((version) => version.id === targetId);
   if (!base || !target) return [];
   const diffs: DiffItem[] = [];
   const targetMap = new Map(target.steps.map((step) => [step.id, step]));
