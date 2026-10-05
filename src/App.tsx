@@ -4,6 +4,7 @@ import {
   Callout,
   Card,
   Checkbox,
+  Dialog,
   Divider,
   Elevation,
   FormGroup,
@@ -16,76 +17,29 @@ import {
   Tag,
   TextArea
 } from '@blueprintjs/core';
+import type {
+  DiffItem,
+  ExperimentProcess,
+  HistoryState,
+  ProcessStatus,
+  ProcessStep,
+  StepStatus,
+  VersionSnapshot,
+  ViewId
+} from './types';
+import {
+  STORAGE_KEY,
+  archiveProcess,
+  computeReclaimable,
+  formatBytes,
+  isRetained,
+  migrateProcess,
+  persistProcess,
+  resolveVersionSteps,
+  type PersistResult,
+  type ReclaimCandidate
+} from './archive';
 
-type StepStatus = 'draft' | 'submitted' | 'confirmed' | 'returned';
-type ProcessStatus = 'draft' | 'in-review' | 'frozen' | 'revising';
-type ViewId = 'editor' | 'review' | 'compare';
-
-interface ReviewComment {
-  id: string;
-  author: string;
-  role: string;
-  text: string;
-  createdAt: string;
-  resolved: boolean;
-}
-
-interface ProcessStep {
-  id: string;
-  title: string;
-  purpose: string;
-  materials: string;
-  equipment: string;
-  amount: string;
-  duration: number;
-  hazards: string[];
-  controls: string;
-  dependencies: string[];
-  safetyNote: string;
-  expectedResult: string;
-  status: StepStatus;
-  comments: ReviewComment[];
-}
-
-interface VersionSnapshot {
-  id: string;
-  label: string;
-  version: string;
-  createdAt: string;
-  note: string;
-  author: string;
-  steps: ProcessStep[];
-}
-
-interface ExperimentProcess {
-  id: string;
-  title: string;
-  code: string;
-  objective: string;
-  principal: string;
-  lab: string;
-  status: ProcessStatus;
-  version: string;
-  steps: ProcessStep[];
-  versions: VersionSnapshot[];
-  frozenAt?: string;
-  updatedAt: string;
-}
-
-interface HistoryState {
-  past: ExperimentProcess[];
-  present: ExperimentProcess;
-  future: ExperimentProcess[];
-}
-
-interface DiffItem {
-  id: string;
-  title: string;
-  kind: 'added' | 'removed' | 'changed';
-  detail: string;
-}
-
-const STORAGE_KEY = 'sologsb-1027-lab-safety-v1';
 const CURRENT_AUTHOR = '周宁';
 const CURRENT_ROLE = '安全复核员';
 const clone = <T,>(value: T): T => JSON.parse(JSON.stringify(value)) as T;
@@ -146,12 +100,12 @@ function initialProcess(): ExperimentProcess {
 
   const firstVersion: VersionSnapshot = {
     id: 'version-1-0', label: '首版批准流程', version: '1.0.0', createdAt: '2026-09-20T14:30:00+08:00',
-    note: '建立基础反应与取样步骤。', author: '王颖',
+    note: '建立基础反应与取样步骤。', author: '王颖', approved: true,
     steps: clone(baseSteps).slice(0, 4).map((step) => ({ ...step, status: 'confirmed', comments: [] }))
   };
   const secondVersion: VersionSnapshot = {
     id: 'version-1-1', label: '补充冷却与废液步骤', version: '1.1.0', createdAt: '2026-09-24T15:10:00+08:00',
-    note: '增加安全冷却、废液处置和现场恢复。', author: '王颖',
+    note: '增加安全冷却、废液处置和现场恢复。', author: '王颖', approved: true,
     steps: clone(baseSteps).map((step) => ({ ...step, status: 'confirmed', comments: [] }))
   };
 
@@ -193,8 +147,9 @@ function loadProcess(): ExperimentProcess {
   try {
     const value = localStorage.getItem(STORAGE_KEY);
     if (!value) return initialProcess();
-    const parsed = JSON.parse(value) as ExperimentProcess;
-    return parsed.id && Array.isArray(parsed.steps) ? parsed : initialProcess();
+    const parsed = JSON.parse(value) as unknown;
+    const migrated = migrateProcess(parsed);
+    return migrated ?? initialProcess();
   } catch {
     return initialProcess();
   }
@@ -230,7 +185,9 @@ function App() {
   const [online, setOnline] = useState(true);
   const [compareBaseId, setCompareBaseId] = useState(process.versions[0]?.id ?? '');
   const [compareTargetId, setCompareTargetId] = useState(process.versions.at(-1)?.id ?? '');
+  const [reclaimPrompt, setReclaimPrompt] = useState<{ candidates: ReclaimCandidate[]; needed: number } | null>(null);
   const initialSaveSkipped = useRef(false);
+  const revisionSourceRef = useRef<string | null>(null);
 
   const selectedStep = process.steps.find((step) => step.id === selectedStepId) ?? process.steps[0];
   const downstreamIds = useMemo(() => collectDownstream(process.steps, lastModifiedId), [process.steps, lastModifiedId]);
@@ -240,14 +197,24 @@ function App() {
   const confirmedCount = process.steps.filter((step) => step.status === 'confirmed').length;
   const reviewProgress = process.steps.length ? Math.round((confirmedCount / process.steps.length) * 100) : 0;
   const versionDiff = useMemo(() => compareVersions(process, compareBaseId, compareTargetId), [process, compareBaseId, compareTargetId]);
+  const reclaimReport = useMemo(() => computeReclaimable(process), [process]);
+
+  const persist = (value: ExperimentProcess): PersistResult => {
+    const result = persistProcess(value);
+    if (!result.ok && result.reason === 'quota') {
+      setReclaimPrompt((prev) => prev ?? { candidates: result.candidates ?? [], needed: result.needed ?? 0 });
+    }
+    return result;
+  };
 
   useEffect(() => {
     if (!initialSaveSkipped.current) {
       initialSaveSkipped.current = true;
       return;
     }
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(process));
-    setSavedLabel(`自动保存 · ${formatDate(new Date().toISOString())}`);
+    const result = persist(process);
+    if (result.ok) setSavedLabel(`自动保存 · ${formatDate(new Date().toISOString())}`);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [process]);
 
   useEffect(() => {
@@ -273,12 +240,13 @@ function App() {
         dispatch({ type: 'redo' });
       } else if (event.key.toLowerCase() === 's') {
         event.preventDefault();
-        localStorage.setItem(STORAGE_KEY, JSON.stringify(process));
-        setSavedLabel(`手动保存 · ${formatDate(new Date().toISOString())}`);
+        const result = persist(process);
+        if (result.ok) setSavedLabel(`手动保存 · ${formatDate(new Date().toISOString())}`);
       }
     };
     window.addEventListener('keydown', handleKeydown);
     return () => window.removeEventListener('keydown', handleKeydown);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [process]);
 
   const commitProcess = (update: (draft: ExperimentProcess) => void): void => {
@@ -414,16 +382,21 @@ function App() {
     const nextNumber = nextMinorVersion(process.version);
     const previousVersionId = process.versions.at(-1)?.id ?? '';
     const frozenVersionId = uid('version');
+    const revisionSourceId = process.status === 'revising'
+      ? (revisionSourceRef.current ?? previousVersionId)
+      : undefined;
     commitProcess((draft) => {
       draft.versions.push({
         id: frozenVersionId, label: '复核通过冻结版', version: nextNumber,
         createdAt: new Date().toISOString(), note: `${draft.steps.length} 个步骤全部确认，安全控制完整。`,
-        author: CURRENT_AUTHOR, steps: clone(draft.steps)
+        author: CURRENT_AUTHOR, approved: true, revisionOf: revisionSourceId,
+        steps: clone(draft.steps)
       });
       draft.version = nextNumber;
       draft.status = 'frozen';
       draft.frozenAt = new Date().toISOString();
     });
+    revisionSourceRef.current = null;
     setSavedLabel(`版本 ${nextNumber} 已冻结`);
     setCompareBaseId(previousVersionId);
     setCompareTargetId(frozenVersionId);
@@ -431,6 +404,8 @@ function App() {
 
   const startRevision = (): void => {
     if (process.status !== 'frozen') return;
+    const frozenSource = [...process.versions].reverse().find((version) => version.approved) ?? process.versions.at(-1);
+    revisionSourceRef.current = frozenSource?.id ?? null;
     commitProcess((draft) => {
       const nextNumber = nextMinorVersion(draft.version);
       draft.version = `${nextNumber}-revision`;
@@ -454,6 +429,54 @@ function App() {
       });
     });
     setSavedLabel('已保存工作版本快照');
+  };
+
+  const applyArchive = (result: ReturnType<typeof archiveProcess>): void => {
+    if (!result.ok) {
+      setSavedLabel('归档失败，已恢复归档前数据');
+      return;
+    }
+    commitProcess((draft) => {
+      draft.versions = result.process.versions;
+      draft.archiveVersion = result.process.archiveVersion;
+    });
+    const persistResult = persist(result.process);
+    setSavedLabel(persistResult.ok
+      ? `已归档 ${result.archivedCount} 个版本，释放 ${formatBytes(result.freedBytes)}`
+      : '归档完成，但写入仍失败：可回收空间不足');
+  };
+
+  const manualArchive = (): void => {
+    if (reclaimReport.reclaimableBytes <= 0) {
+      setSavedLabel('没有可回收的版本');
+      return;
+    }
+    applyArchive(archiveProcess(process));
+  };
+
+  const confirmReclaim = (): void => {
+    setReclaimPrompt(null);
+    applyArchive(archiveProcess(process));
+  };
+
+  const toggleSign = (versionId: string): void => {
+    commitProcess((draft) => {
+      const version = draft.versions.find((item) => item.id === versionId);
+      if (version) version.signed = !version.signed;
+    });
+  };
+
+  const linkIncident = (versionId: string): void => {
+    const version = process.versions.find((item) => item.id === versionId);
+    if (!version) return;
+    const value = window.prompt('关联事故编号（留空则清除关联）：', version.incidentRef ?? '');
+    if (value === null) return;
+    commitProcess((draft) => {
+      const target = draft.versions.find((item) => item.id === versionId);
+      if (!target) return;
+      const trimmed = value.trim();
+      target.incidentRef = trimmed || undefined;
+    });
   };
 
   return (
@@ -675,14 +698,54 @@ function App() {
 
       {activeView === 'compare' && (
         <main className="compare-layout">
+          <Card elevation={Elevation.ONE} className="archive-card">
+            <div className="card-title">
+              <div><span>VERSION ARCHIVE</span><h3>版本归档</h3></div>
+              <Tag minimal intent={reclaimReport.reclaimableBytes > 0 ? 'warning' : 'success'}>
+                {reclaimReport.reclaimableBytes > 0 ? `可回收 ${formatBytes(reclaimReport.reclaimableBytes)}` : '空间充足'}
+              </Tag>
+            </div>
+            <p className="muted">连续快照按字段差异压缩为增量；已批准、已签名、事故关联和修订来源版本保留完整快照，不参与归档。</p>
+            <div className="archive-stats">
+              <div><span>当前占用</span><strong>{formatBytes(reclaimReport.totalBytes)}</strong></div>
+              <div><span>可回收</span><strong className={reclaimReport.reclaimableBytes ? 'danger-text' : ''}>{formatBytes(reclaimReport.reclaimableBytes)}</strong></div>
+              <div><span>可归档版本</span><strong>{reclaimReport.archivableCount} 个</strong></div>
+              <div><span>保留版本</span><strong>{reclaimReport.retainedCount} 个</strong></div>
+            </div>
+            <Button intent="primary" icon="compressed" text="归档可回收版本" disabled={reclaimReport.reclaimableBytes <= 0} onClick={manualArchive} />
+          </Card>
           <Card elevation={Elevation.ONE} className="version-panel">
             <div className="card-title"><div><span>VERSION TIMELINE</span><h3>冻结版本</h3></div><Tag minimal>{process.versions.length} 个</Tag></div>
             <div className="version-timeline">
-              {process.versions.map((version, index) => (
-                <article key={version.id} className={index === process.versions.length - 1 ? 'latest' : ''}>
-                  <span></span><div><b>{version.version}</b><strong>{version.label}</strong><p>{formatDate(version.createdAt)} · {version.steps.length} 个步骤 · {version.author}</p><small>{version.note}</small></div>
-                </article>
-              ))}
+              {process.versions.map((version, index) => {
+                const stepCount = resolveVersionSteps(process.versions, version.id)?.length ?? 0;
+                const retained = isRetained(version, process.versions);
+                return (
+                  <article key={version.id} className={index === process.versions.length - 1 ? 'latest' : ''}>
+                    <span></span>
+                    <div>
+                      <b>{version.version}</b>
+                      <strong>{version.label}</strong>
+                      <p>{formatDate(version.createdAt)} · {stepCount} 个步骤 · {version.author}</p>
+                      <div className="version-badges">
+                        {version.approved && <Tag minimal intent="success">已批准</Tag>}
+                        {version.signed && <Tag minimal intent="primary">已签名</Tag>}
+                        {version.incidentRef && <Tag minimal intent="danger">事故关联 {version.incidentRef}</Tag>}
+                        {process.versions.some((item) => item.revisionOf === version.id) && <Tag minimal intent="warning">修订来源</Tag>}
+                        {retained && index !== 0 && <Tag minimal>保留</Tag>}
+                        {version.delta && <Tag minimal icon="compressed">增量</Tag>}
+                      </div>
+                      <small>{version.note}</small>
+                      {!retained && (
+                        <div className="version-actions">
+                          <Button minimal small icon={version.signed ? 'tick' : 'edit'} text={version.signed ? '已签名' : '签名'} onClick={() => toggleSign(version.id)} />
+                          <Button minimal small icon="link" text={version.incidentRef ? '事故已关联' : '关联事故'} onClick={() => linkIncident(version.id)} />
+                        </div>
+                      )}
+                    </div>
+                  </article>
+                );
+              })}
             </div>
           </Card>
           <Card elevation={Elevation.ONE} className="diff-panel">
@@ -711,6 +774,36 @@ function App() {
         <span>所有实验数据仅保存在当前浏览器 localStorage。</span>
         <span>Ctrl/Cmd + Z 撤销 · Ctrl/Cmd + Y 重做 · Ctrl/Cmd + S 保存</span>
       </footer>
+
+      <Dialog
+        isOpen={reclaimPrompt !== null}
+        onClose={() => setReclaimPrompt(null)}
+        title="容量不足，需要归档旧版本"
+        icon="compressed"
+        className="reclaim-dialog"
+      >
+        <div className="bp6-dialog-body">
+          <Callout intent="warning" icon="warning-sign">
+            本地存储容量不足，本次写入已被拒绝。以下 {reclaimPrompt?.candidates.length ?? 0} 个版本将压缩为增量后回收空间，确认后才会执行。
+          </Callout>
+          <p className="muted">已批准、已签名、事故关联和修订来源版本属于保留项，不会被归档。</p>
+          <div className="reclaim-list">
+            {(reclaimPrompt?.candidates ?? []).map((candidate) => (
+              <div key={candidate.versionId} className="reclaim-item">
+                <Checkbox checked disabled label={`${candidate.version} · ${candidate.label}`} />
+                <Tag minimal>{formatBytes(candidate.bytes)}</Tag>
+              </div>
+            ))}
+            {!reclaimPrompt?.candidates.length && <p className="muted">没有可回收的版本，请删除部分内容后再试。</p>}
+          </div>
+        </div>
+        <div className="bp6-dialog-footer">
+          <div className="bp6-dialog-footer-actions">
+            <Button text="取消" onClick={() => setReclaimPrompt(null)} />
+            <Button intent="primary" icon="compressed" text="确认归档并继续写入" disabled={!reclaimPrompt?.candidates.length} onClick={confirmReclaim} />
+          </div>
+        </div>
+      </Dialog>
     </div>
   );
 }
@@ -740,16 +833,16 @@ function nextMinorVersion(value: string): string {
 }
 
 function compareVersions(process: ExperimentProcess, baseId: string, targetId: string): DiffItem[] {
-  const base = process.versions.find((version) => version.id === baseId);
-  const target = process.versions.find((version) => version.id === targetId);
-  if (!base || !target) return [];
+  const baseSteps = resolveVersionSteps(process.versions, baseId);
+  const targetSteps = resolveVersionSteps(process.versions, targetId);
+  if (!baseSteps || !targetSteps) return [];
   const diffs: DiffItem[] = [];
-  const targetMap = new Map(target.steps.map((step) => [step.id, step]));
-  const baseMap = new Map(base.steps.map((step) => [step.id, step]));
-  base.steps.forEach((step) => {
+  const targetMap = new Map(targetSteps.map((step) => [step.id, step]));
+  const baseMap = new Map(baseSteps.map((step) => [step.id, step]));
+  baseSteps.forEach((step) => {
     if (!targetMap.has(step.id)) diffs.push({ id: step.id, title: step.title, kind: 'removed', detail: '目标版本已删除该步骤。' });
   });
-  target.steps.forEach((step) => {
+  targetSteps.forEach((step) => {
     const before = baseMap.get(step.id);
     if (!before) {
       diffs.push({ id: step.id, title: step.title, kind: 'added', detail: `${step.duration} 分钟；危险项：${step.hazards.join('、') || '无'}` });

@@ -151,10 +151,28 @@ button, input, textarea, select { font: inherit; }
 .freeze-rules > div strong { font-size: 10px; }
 .freeze-rules > div small { color: #8692a1; font-size: 9px; }
 .freeze-rules .bp6-button { margin-top: 14px; }
+.archive-card { grid-column: 1 / -1; padding: 19px; border: 1px solid var(--line); border-radius: 10px; }
+.archive-card .muted { margin: 0 0 14px; }
+.archive-stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 16px; }
+.archive-stats > div { padding: 12px 14px; border: 1px solid #e2e7ed; border-radius: 8px; background: #f8fafb; }
+.archive-stats span, .archive-stats strong { display: block; }
+.archive-stats span { color: #758192; font-size: 9px; }
+.archive-stats strong { margin-top: 5px; font: 600 14px "IBM Plex Mono", monospace; }
+.version-badges { display: flex; flex-wrap: wrap; gap: 4px; margin: 6px 0; }
+.version-actions { display: flex; gap: 2px; margin-top: 6px; }
+.version-actions .bp6-button { font-size: 10px; }
+.reclaim-dialog .bp6-dialog-body { display: grid; gap: 10px; }
+.reclaim-dialog .bp6-callout { margin: 0; }
+.reclaim-dialog .muted { margin: 0; }
+.reclaim-list { display: grid; gap: 6px; max-height: 280px; overflow-y: auto; }
+.reclaim-item { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 8px 12px; border: 1px solid #e2e7ed; border-radius: 8px; background: #f8fafb; }
+.reclaim-item .bp6-checkbox { margin: 0; }
+.reclaim-item .bp6-checkbox label { font-size: 11px; }
 .app-footer { min-height: 42px; padding: 13px 22px; display: flex; justify-content: space-between; gap: 20px; color: #778496; background: #e9edf2; border-top: 1px solid #d8dee5; font-size: 9px; }
 @media (max-width: 1240px) {
   .process-banner { grid-template-columns: 1fr 1fr; }
   .banner-progress { grid-column: 1 / 3; }
+  .archive-stats { grid-template-columns: repeat(2, 1fr); }
   .editor-layout { grid-template-columns: 260px 1fr; }
   .inspector-panel { grid-column: 1 / 3; position: static; grid-template-columns: repeat(3, 1fr); }
   .review-layout { grid-template-columns: 260px 1fr; }
